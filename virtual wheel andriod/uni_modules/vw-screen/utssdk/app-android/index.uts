@@ -1,0 +1,63 @@
+import { UTSAndroid } from 'io.dcloud.uts'
+import Activity from 'android.app.Activity'
+
+/**
+ * vw-screen：手动切换横竖屏
+ *
+ * 为什么单独做成 uts 插件：本项目开了蒸汽模式（vapor），uvue 页面是 JS 驱动的，
+ * 不能直接调原生 API（包括 utsAndroid），所以「调 Activity.setRequestedOrientation」这件事
+ * 只能放进 uts 插件里，页面通过 import 调用导出的函数。
+ *
+ * 屏幕方向常量（android.content.pm.ActivityInfo 里的值，这里用字面量避免访问 Java 静态字段）：
+ *   6  = SCREEN_ORIENTATION_SENSOR_LANDSCAPE  横屏，允许左右两个方向
+ *   7  = SCREEN_ORIENTATION_SENSOR_PORTRAIT   竖屏，允许正反两个方向
+ *   10 = SCREEN_ORIENTATION_FULL_SENSOR       跟随重力，四个方向都行
+ */
+
+const ORIENT_SENSOR_LANDSCAPE: Int = 6
+const ORIENT_SENSOR_PORTRAIT: Int = 7
+const ORIENT_FULL_SENSOR: Int = 10
+
+let sMode: string = 'auto'
+let sErr: string = ''
+
+/**
+ * 设置屏幕方向
+ * @param mode "auto" | "landscape" | "portrait"
+ */
+export function setOrientation(mode: string): void {
+	let code: Int = ORIENT_FULL_SENSOR
+	let m: string = 'auto'
+	if (mode == 'landscape') {
+		code = ORIENT_SENSOR_LANDSCAPE
+		m = 'landscape'
+	} else if (mode == 'portrait') {
+		code = ORIENT_SENSOR_PORTRAIT
+		m = 'portrait'
+	}
+	sErr = ''
+	sMode = m
+	try {
+		// 官方文档里就是这样用的（UTSAndroid.getUniActivity()!），
+		// 万一拿不到 Activity 会抛异常，下面 catch 掉，界面只显示错误不影响其他功能
+		const act: Activity | null = UTSAndroid.getUniActivity()
+		if (act != null) {
+			act.setRequestedOrientation(code)
+		} else {
+			sErr = '拿不到 Activity，无法切换屏幕方向'
+		}
+	} catch (e) {
+		sErr = '切换屏幕方向失败：' + e
+	}
+}
+
+/**
+ * 当前设置的方向（不读系统真实方向，只回显最后一次设置的意图）
+ */
+export function getOrientation(): string {
+	return sMode
+}
+
+export function getLastError(): string {
+	return sErr
+}

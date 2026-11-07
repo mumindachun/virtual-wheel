@@ -1,0 +1,15 @@
+{
+	"id": "vw-screen",
+	"displayName": "vw-screen 屏幕方向",
+	"version": "0.1.0",
+	"description": "虚拟方向盘：手动切换横竖屏（蒸汽模式下页面不能直接调原生 API，所以放 uts 插件里）",
+	"keywords": ["screen", "orientation"],
+	"uni_modules": {
+		"platforms": {
+			"android": {
+				"minVersion": "5.0"
+			},
+			"web": {}
+		}
+	}
+}

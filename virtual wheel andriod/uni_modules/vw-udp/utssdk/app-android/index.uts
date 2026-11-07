@@ -1,0 +1,622 @@
+/**
+ * vw-udp —— 虚拟方向盘 demo 的 Android 端 UDP 发送器
+ *
+ * 为什么需要这个插件：
+ *   uni-app x 里没有 UDP 相关的 uni API（没有 uni.createUDPSocket），
+ *   而蒸汽模式（vapor）的 uvue 页面是 JS 驱动，页面里不能直接调原生 API，
+ *   所以 java.net 的 DatagramSocket 只能写在 uts 插件里，页面通过
+ *   import { openUdp, sendSample, ... } from '@/uni_modules/vw-udp' 调用。
+ *
+ * 为什么要单独开线程：
+ *   uni-app x 中 uts 代码默认运行在 Android 的 main（UI）线程，
+ *   直接在主线程 sock.send() 会抛 NetworkOnMainThreadException。
+ *   这里用一个常驻后台线程负责发送：主线程只把「最新样本 / 待发配置 / 按键位图」
+ *   写进变量并用 Semaphore.release() 踢一下，后台线程 acquire() 醒来后真正 send()。
+ *
+ * 为什么还要读系统的「旋转向量」传感器：
+ *   陀螺仪积分会漂。Android 的 TYPE_ROTATION_VECTOR 是系统融合出来的姿态四元数
+ *   （加速度计 + 陀螺仪 + 磁力计，由 SensorService 里的融合器算），
+ *   它不漂，但延迟大（50~150ms）且可能被车内磁场拖歪。
+ *   所以这里只是把四元数**跟着样本一起发上去**，由电脑端决定怎么用
+ *   （当前用法：只做时间常数约 40 秒的慢修正，实时输出仍然来自陀螺仪）。
+ *
+ * 协议 v3（小端），电脑端 run.py 严格按这个解包：
+ *
+ *   样本包 104 字节  "<ii7dii4d>"
+ *     Int    type    固定 1
+ *     Int    seq     包序号，从 1 开始递增（用来算丢包）
+ *     Double gx, gy, gz  陀螺仪三轴角速度（rad/s）
+ *     Double ax, ay, az  加速度计三轴（单位 g，静止平放 az ≈ 1.0）
+ *     Double t       采样时刻的毫秒时间戳（Date.now()，Unix epoch ms）
+ *     Int    btnMask 按键位图：bit0=A bit1=B bit2=X bit3=Y bit4=LB
+ *                    bit5=RB bit6=LT bit7=RT bit8=L3 bit9=L4
+ *     Int    flags   一次性标志：bit0=角度归零（回正） bit1=重新校准
+ *     Double qx, qy, qz, qw  姿态四元数（Android 旋转向量格式，全 0 = 没有姿态数据）
+ *
+ *   配置包 36 字节  "<iii3d>"
+ *     Int    type    固定 2
+ *     Int    rangeDeg   角度范围（540 或 90）
+ *     Int    axis       转向轴（0=X 1=Y 2=Z 3=自动识别）
+ *     Double deadzone   死区（rad/s）
+ *     Double smoothing  平滑系数（0~0.95）
+ *     Double selfCenter 自动回正速率（1/秒，0 = 关）
+ *
+ * 为什么所有数值都是 double 而不是 float32：
+ *   1) uts 的 number 在 Kotlin 里本来就是 Double，不用做 Float 转换；
+ *   2) t 是 Unix epoch 毫秒（约 1.7e12），float32 只有 24 位尾数，
+ *      在这个量级上步进约 131072ms（两分多钟），时间戳会被压成废数。
+ *
+ * 为什么 type 用 Int32 而不是一个字节：
+ *   uts 里 Int 转 Byte 要走 toByte()，编译风险高；多 3 个字节对局域网无所谓。
+ *
+ * 为什么要用 Int / Double 而不是 number：
+ *   uts 的 number 在 Kotlin 里编译成抽象类 Number，而
+ *   ByteBuffer.allocate 要 Int、putDouble 要 Double、DatagramPacket 的长度和端口要 Int。
+ *   官方文档明确写了「入参要求传入 Int，那么传入 number 会报错」，
+ *   所以凡是喂给原生 API 的数字都必须显式写成 Int / Double。
+ *   只有跨给页面的壳层（函数参数、返回值）用 number，并在边界上转换。
+ */
+
+import DatagramSocket from 'java.net.DatagramSocket';
+import DatagramPacket from 'java.net.DatagramPacket';
+import InetAddress from 'java.net.InetAddress';
+import ByteBuffer from 'java.nio.ByteBuffer';
+import ByteOrder from 'java.nio.ByteOrder';
+import Semaphore from 'java.util.concurrent.Semaphore';
+import Thread from 'java.lang.Thread';
+import System from 'java.lang.System';
+import Context from 'android.content.Context';
+import Sensor from 'android.hardware.Sensor';
+import SensorManager from 'android.hardware.SensorManager';
+import SensorEvent from 'android.hardware.SensorEvent';
+import SensorEventListener from 'android.hardware.SensorEventListener';
+import { UTSAndroid } from 'io.dcloud.uts';
+
+const PKT_SAMPLE: Int = 104; // 4 + 4 + 7*8 + 4 + 4 + 4*8
+const PKT_CONFIG: Int = 36; // 4 + 4 + 4 + 3*8
+const TYPE_SAMPLE: Int = 1;
+const TYPE_CONFIG: Int = 2;
+
+// 直接写字面量而不是 SensorManager.SENSOR_DELAY_GAME / Sensor.TYPE_ROTATION_VECTOR，
+// 是为了避开 uts 里访问 Java 静态字段的兼容性风险（这两个常量在 Android 里是固定值）
+const DELAY_GAME: Int = 1; // SensorManager.SENSOR_DELAY_GAME（约 20ms 一批）
+const TYPE_ROTATION_VECTOR: Int = 11; // Sensor.TYPE_ROTATION_VECTOR
+const SERVICE_SENSOR: string = 'sensor'; // Context.SENSOR_SERVICE
+
+// 陀螺仪/加速度计我们自己注册，采样周期直接给微秒数：
+//   SENSOR_DELAY_GAME 是 1(单位是“档位”，对应 20000us = 50Hz)
+//   这里直接给 5000us = 200Hz（设备给不了这么快时会自动降到它能做到的最高频率）
+const TYPE_GYROSCOPE: Int = 4; // Sensor.TYPE_GYROSCOPE
+const TYPE_ACCELEROMETER: Int = 1; // Sensor.TYPE_ACCELEROMETER
+const MOTION_US: Int = 5000;
+
+// ---- 模块级状态（后台线程和主线程共用） ----
+let sHost: string = '127.0.0.1';
+let sPort: Int = 8888;
+let sRunning: boolean = false;
+let sGen: Int = 0; // 每次 openUdp 加一，旧线程发现代次不对就自行退出，避免“停止后马上重开”时两个线程同时发包
+let sSeq: Int = 0;
+let sSent: Int = 0;
+let sErr: string = '';
+
+// 最新传感器样本（主线程覆盖写，后台线程取用）
+let sGx: Double = 0.0;
+let sGy: Double = 0.0;
+let sGz: Double = 0.0;
+let sAx: Double = 0.0;
+let sAy: Double = 0.0;
+let sAz: Double = 0.0;
+let sT: Double = 0.0;
+let sHasSample: boolean = false;
+
+// 按键位图（状态，不是事件）与一次性标志
+let sBtnMask: Int = 0;
+let sFlags: Int = 0;
+let sFlagsLeft: Int = 0; // 标志位还要重复发几包，防止恰好那一包丢了
+
+// 待下发的配置（发出一次后清掉标志）
+let sCfgRange: Int = 540;
+let sCfgAxis: Int = 3;
+let sCfgDeadzone: Double = 0.02;
+let sCfgSmoothing: Double = 0.3;
+let sCfgSelfCenter: Double = 0.0;
+let sHasConfig: boolean = false;
+
+// 系统旋转向量（姿态四元数）：由传感器回调写入，全 0 表示还没有数据
+let sQx: Double = 0.0;
+let sQy: Double = 0.0;
+let sQz: Double = 0.0;
+let sQw: Double = 0.0;
+let sAttStatus: string = '未启动';
+let sAttListener: RotationVectorListener | null = null;
+let sSensorManager: SensorManager | null = null;
+
+// 陀螺仪/加速度计（插件自己采样，比 uni.startGyroscope 的 50Hz 快）
+let sSampleId: Int = 0; // 每采到一个新样本 +1
+let sSentId: Int = -1; // 已经发出去的最新样本号，避免重复发同一个样本
+let sMotionStatus: string = '未启动';
+let sMotionListeners: MotionListener[] = [];
+let sPumpFromAccel: boolean = false; // 陀螺仪注册失败时，退化成用加速度计触发发包
+
+// 主线程 release()，后台线程 acquire()
+let sSem: Semaphore = new Semaphore(0);
+
+/**
+ * 系统旋转向量的监听器。
+ * 回调发生在注册它的线程（这里是主线程），只做几次赋值，开销可以忽略。
+ * 注意：TYPE_ROTATION_VECTOR 给的是 (x, y, z, w) = (轴*sin(θ/2), cos(θ/2))。
+ */
+class RotationVectorListener extends SensorEventListener {
+
+	override onSensorChanged(event: SensorEvent): void {
+		try {
+			const v = event.values;
+			sQx = v[0].toDouble();
+			sQy = v[1].toDouble();
+			sQz = v[2].toDouble();
+			sQw = v[3].toDouble();
+			if (sAttStatus != 'ok') {
+				sAttStatus = 'ok';
+			}
+		} catch (e) {
+			console.log('[vw-udp] rotation vector read error', e);
+			sAttStatus = '读取姿态失败';
+		}
+	}
+
+	override onAccuracyChanged(sensor: Sensor, accuracy: Int): void {
+		// 精度变化（磁力计被干扰时 accuracy 会掉到 LOW）暂时只记日志
+		if (accuracy < 2) {
+			sAttStatus = 'ok（精度低，可能有磁干扰）';
+		}
+	}
+}
+
+/**
+ * 注册系统旋转向量传感器。失败不影响 UDP 发送，只是没有姿态参考。
+ * 必须在有 Looper 的线程调用（页面里就是主线程），所以放在 openUdp 里。
+ */
+function startAttitude(): void {
+	if (sAttListener != null) {
+		return;
+	}
+	try {
+		const ctx = UTSAndroid.getAppContext();
+		if (ctx == null) {
+			sAttStatus = '拿不到应用 Context';
+			return;
+		}
+		const sm = ctx.getSystemService(SERVICE_SENSOR) as SensorManager;
+		if (sm == null) {
+			sAttStatus = '没有传感器服务';
+			return;
+		}
+		const sensor = sm.getDefaultSensor(TYPE_ROTATION_VECTOR);
+		if (sensor == null) {
+			sAttStatus = '这台设备没有旋转向量传感器';
+			return;
+		}
+		const listener = new RotationVectorListener();
+		const ok = sm.registerListener(listener, sensor, DELAY_GAME);
+		if (!ok) {
+			sAttStatus = '注册传感器失败';
+			return;
+		}
+		sSensorManager = sm;
+		sAttListener = listener;
+		sAttStatus = '等待数据…';
+	} catch (e) {
+		console.log('[vw-udp] startAttitude error', e);
+		sAttStatus = '启动姿态传感器失败';
+	}
+}
+
+/**
+ * 注销传感器，并把四元数清 0（电脑端看到全 0 就知道没有姿态数据了）。
+ */
+function stopAttitude(): void {
+	try {
+		if (sSensorManager != null && sAttListener != null) {
+			sSensorManager!.unregisterListener(sAttListener!);
+		}
+	} catch (e) {
+		console.log('[vw-udp] stopAttitude error', e);
+	}
+	sSensorManager = null;
+	sAttListener = null;
+	sAttStatus = '未启动';
+	sQx = 0.0;
+	sQy = 0.0;
+	sQz = 0.0;
+	sQw = 0.0;
+}
+
+/**
+ * 陀螺仪 / 加速度计监听器。
+ * 每来一个样本：把值写进模块变量、记时间戳、给后台线程一个信号（release），
+ * 真正的 socket.send 在后台线程做（传感器回调在主线程，主线程不能做网络）。
+ */
+class MotionListener extends SensorEventListener {
+
+	isGyro: boolean = true;
+
+	constructor(isGyro: boolean) {
+		super();
+		this.isGyro = isGyro;
+	}
+
+	override onSensorChanged(event: SensorEvent): void {
+		try {
+			const v = event.values;
+			if (this.isGyro) {
+				sGx = v[0].toDouble();
+				sGy = v[1].toDouble();
+				sGz = v[2].toDouble();
+			} else {
+				sAx = v[0].toDouble();
+				sAy = v[1].toDouble();
+				sAz = v[2].toDouble();
+			}
+			// 陀螺仪负责驱动发包；陀螺仪不可用时才让加速度计驱动
+			if (!this.isGyro && !sPumpFromAccel) {
+				return;
+			}
+			sT = System.currentTimeMillis().toDouble();
+			sHasSample = true;
+			sSampleId = sSampleId + 1;
+			sSem.release();
+		} catch (e) {
+			console.log('[vw-udp] motion read error', e);
+		}
+	}
+
+	override onAccuracyChanged(sensor: Sensor, accuracy: Int): void {
+		// 精度变化不影响数据格式，忽略
+	}
+}
+
+/**
+ * 注册陀螺仪与加速度计（5000us ≈ 200Hz，设备做不到会自动降频）。
+ * 和 startAttitude 一样必须在主线程调用（openUdp 就在主线程）。
+ */
+function startMotion(): void {
+	if (sMotionListeners.length > 0) {
+		return;
+	}
+	try {
+		const ctx = UTSAndroid.getAppContext();
+		if (ctx == null) {
+			sMotionStatus = '拿不到应用 Context';
+			return;
+		}
+		const sm = ctx.getSystemService(SERVICE_SENSOR) as SensorManager;
+		if (sm == null) {
+			sMotionStatus = '没有传感器服务';
+			return;
+		}
+		sSensorManager = sm;
+
+		const gyro = sm.getDefaultSensor(TYPE_GYROSCOPE);
+		if (gyro != null) {
+			const gl = new MotionListener(true);
+			if (sm.registerListener(gl, gyro, MOTION_US)) {
+				sMotionListeners.push(gl);
+				sPumpFromAccel = false;
+			} else {
+				sPumpFromAccel = true;
+			}
+		} else {
+			sPumpFromAccel = true;
+		}
+
+		const accel = sm.getDefaultSensor(TYPE_ACCELEROMETER);
+		if (accel != null) {
+			const al = new MotionListener(false);
+			if (sm.registerListener(al, accel, MOTION_US)) {
+				sMotionListeners.push(al);
+			}
+		}
+
+		if (sMotionListeners.length == 0) {
+			sMotionStatus = '没有可用的陀螺仪/加速度计';
+		} else if (sPumpFromAccel) {
+			sMotionStatus = '没有陀螺仪，改用加速度计（200Hz）';
+		} else {
+			sMotionStatus = '200Hz';
+		}
+	} catch (e) {
+		console.log('[vw-udp] startMotion error', e);
+		sMotionStatus = '启动传感器失败';
+	}
+}
+
+function stopMotion(): void {
+	try {
+		if (sSensorManager != null) {
+			for (let i = 0; i < sMotionListeners.length; i = i + 1) {
+				sSensorManager!.unregisterListener(sMotionListeners[i]);
+			}
+		}
+	} catch (e) {
+		console.log('[vw-udp] stopMotion error', e);
+	}
+	sMotionListeners = [];
+	sMotionStatus = '未启动';
+}
+
+/**
+ * 后台发送线程：负责 DNS/建 socket/真正发包。线程退出时自己关闭 socket。
+ */
+class UdpSenderThread extends Thread {
+
+	gen: Int = 0;
+
+	constructor(gen: Int) {
+		super();
+		this.gen = gen;
+	}
+
+	override run(): void {
+		try {
+			// getByName 对纯 IP 不做 DNS；写主机名时会 DNS，所以也必须放在子线程
+			const addr = InetAddress.getByName(sHost);
+			const sock = new DatagramSocket();
+			try {
+				sendLoop(sock, addr, this.gen);
+			} catch (e) {
+				console.log('[vw-udp] send loop error', e);
+				sErr = '发送失败，请检查 IP / 端口 / 电脑防火墙';
+			}
+			try {
+				sock.close();
+			} catch (e) {
+				console.log('[vw-udp] close socket error', e);
+			}
+		} catch (e) {
+			console.log('[vw-udp] init socket error', e);
+			sErr = '无法创建 UDP socket 或解析电脑 IP';
+		}
+		sRunning = false;
+	}
+}
+
+/**
+ * 后台线程里的死循环：等信号 → 先发配置（如果有）→ 再发样本。
+ * 没有新数据时阻塞在 sSem.acquire() 上，不占 CPU。
+ */
+function sendLoop(sock: DatagramSocket, addr: InetAddress, gen: Int): void {
+	while (sRunning && gen == sGen) {
+		sSem.acquire();
+		if (!sRunning || gen != sGen) {
+			break;
+		}
+
+		// 配置包：只在开始发送 / 设置变化时发一次
+		if (sHasConfig) {
+			sHasConfig = false;
+			const cb = ByteBuffer.allocate(PKT_CONFIG);
+			cb.order(ByteOrder.LITTLE_ENDIAN);
+			cb.putInt(TYPE_CONFIG);
+			cb.putInt(sCfgRange);
+			cb.putInt(sCfgAxis);
+			cb.putDouble(sCfgDeadzone);
+			cb.putDouble(sCfgSmoothing);
+			cb.putDouble(sCfgSelfCenter);
+			const cfgBytes = cb.array();
+			sock.send(new DatagramPacket(cfgBytes, PKT_CONFIG, addr, sPort));
+		}
+
+		// 样本包：永远发「最新」的那一个，旧的直接丢掉（实时性比完整性重要）
+		// 用样本号去重：200Hz 采样时后台线程万一慢一点，信号会排队，
+		// 这里保证同一个样本不会重复发好几遍（否则电脑端会看到重复的 seq 数据）
+		if (sHasSample && sSampleId != sSentId) {
+			sSentId = sSampleId;
+			sHasSample = false;
+
+			const gx = sGx;
+			const gy = sGy;
+			const gz = sGz;
+			const ax = sAx;
+			const ay = sAy;
+			const az = sAz;
+			const t = sT;
+			const qx = sQx;
+			const qy = sQy;
+			const qz = sQz;
+			const qw = sQw;
+
+			const buf = ByteBuffer.allocate(PKT_SAMPLE);
+			buf.order(ByteOrder.LITTLE_ENDIAN);
+			buf.putInt(TYPE_SAMPLE);
+			sSeq = sSeq + 1;
+			buf.putInt(sSeq);
+			buf.putDouble(gx);
+			buf.putDouble(gy);
+			buf.putDouble(gz);
+			buf.putDouble(ax);
+			buf.putDouble(ay);
+			buf.putDouble(az);
+			buf.putDouble(t);
+			buf.putInt(sBtnMask);
+			buf.putInt(sFlags);
+			buf.putDouble(qx);
+			buf.putDouble(qy);
+			buf.putDouble(qz);
+			buf.putDouble(qw);
+
+			const bytes = buf.array();
+			sock.send(new DatagramPacket(bytes, PKT_SAMPLE, addr, sPort));
+			sSent = sSent + 1;
+
+			// 标志位连发 3 包，避免恰好那一包丢了导致「回正」没生效
+			if (sFlagsLeft > 0) {
+				sFlagsLeft = sFlagsLeft - 1;
+				if (sFlagsLeft == 0) {
+					sFlags = 0;
+				}
+			}
+		}
+	}
+}
+
+/**
+ * 开始发送：注册姿态传感器（旋转向量）+ 陀螺仪/加速度计（200Hz），并起后台发送线程。
+ * 传感器全部在插件内部采集，页面不用再调 uni.startGyroscope。
+ * @param host 电脑局域网 IP，例如 "192.168.1.100"
+ * @param port 电脑端口，例如 8888
+ */
+export function openUdp(host: string, port: number): void {
+	if (sRunning) {
+		return;
+	}
+	sHost = host;
+	sPort = port.toInt();
+	sErr = '';
+	sSeq = 0;
+	sSent = 0;
+	sHasSample = false;
+	sSampleId = 0;
+	sSentId = -1;
+	sRunning = true;
+	sGen = sGen + 1;
+	startAttitude();
+	startMotion();
+	// 踢一下可能还阻塞在 acquire() 上的旧线程，让它看到代次变了赶紧退出
+	sSem.release();
+	const t = new UdpSenderThread(sGen);
+	t.start();
+}
+
+/**
+ * 手动投递一个样本（保留兼容用；正常运行时样本由插件内部的传感器回调采集，
+ * 页面不再需要调用它，所以这里用不上 JS 桥的 50Hz 开销）。
+ * @param gx/gy/gz 陀螺仪三轴角速度（rad/s）
+ * @param ax/ay/az 加速度计三轴（单位 g）
+ * @param t        采样时刻的毫秒时间戳
+ */
+export function sendSample(gx: number, gy: number, gz: number, ax: number, ay: number, az: number, t: number): void {
+	if (!sRunning) {
+		return;
+	}
+	sGx = gx.toDouble();
+	sGy = gy.toDouble();
+	sGz = gz.toDouble();
+	sAx = ax.toDouble();
+	sAy = ay.toDouble();
+	sAz = az.toDouble();
+	sT = t.toDouble();
+	sHasSample = true;
+	sSampleId = sSampleId + 1;
+	sSem.release();
+}
+
+/**
+ * 更新当前按住的按键位图（它会跟着每一个样本包一起发出去）。
+ * 用位图而不是「按下/松开事件包」：位图是状态，丢一包下一包就自动纠正了。
+ * bit0=A bit1=B bit2=X bit3=Y bit4=LB bit5=RB bit6=LT bit7=RT bit8=L3 bit9=L4
+ */
+export function setButtons(mask: number): void {
+	sBtnMask = mask.toInt();
+	if (sRunning) {
+		sSem.release();
+	}
+}
+
+/**
+ * 请求电脑端做一次性动作（标志会连发 3 包）：
+ *   bit0 = 角度归零（回正）
+ *   bit1 = 重新校准零偏
+ */
+export function pushFlags(flags: number): void {
+	sFlags = sFlags | flags.toInt();
+	sFlagsLeft = 3;
+	if (sRunning) {
+		sSem.release();
+	}
+}
+
+/**
+ * 下发处理参数（电脑端收到后立即生效，可以在运行中随时改）。
+ * @param rangeDeg   角度范围，540 或 90
+ * @param axis       转向轴，0=X 1=Y 2=Z 3=自动识别
+ * @param deadzone   死区（rad/s）
+ * @param smoothing  平滑系数（0~0.95，越大越平顺但越迟滞）
+ * @param selfCenter 自动回正速率（1/秒，0 = 关闭）
+ */
+export function sendConfig(rangeDeg: number, axis: number, deadzone: number, smoothing: number, selfCenter: number): void {
+	sCfgRange = rangeDeg.toInt();
+	sCfgAxis = axis.toInt();
+	sCfgDeadzone = deadzone.toDouble();
+	sCfgSmoothing = smoothing.toDouble();
+	sCfgSelfCenter = selfCenter.toDouble();
+	sHasConfig = true;
+	if (sRunning) {
+		sSem.release();
+	}
+}
+
+/**
+ * 停止发送（后台线程醒来后自己退出并关闭 socket），同时停掉姿态与运动传感器。
+ */
+export function closeUdp(): void {
+	stopMotion();
+	stopAttitude();
+	if (!sRunning) {
+		return;
+	}
+	sRunning = false;
+	sSem.release();
+}
+
+/**
+ * 最新的三轴角速度（rad/s）。采样发生在插件内部的后台回调里，
+ * 页面不再需要 uni.startGyroscope，只需要偶尔读一下用于显示。
+ */
+export function getGx(): number {
+	return Number.from(sGx);
+}
+
+export function getGy(): number {
+	return Number.from(sGy);
+}
+
+export function getGz(): number {
+	return Number.from(sGz);
+}
+
+/**
+ * 传感器采样状态：'200Hz' / '没有陀螺仪，改用加速度计（200Hz）' / '未启动' 等。
+ * 注意这里的 “200Hz” 是请求频率，设备实际能给多少要看硬件。
+ */
+export function getMotionStatus(): string {
+	return sMotionStatus;
+}
+
+/**
+ * 插件内部累计采到的样本数，页面用它算实际采样率/发送率。
+ */
+export function getSampleId(): number {
+	return Number.from(sSampleId);
+}
+
+/**
+ * 已经成功发出的包数，页面用来显示状态。
+ */
+export function getSentCount(): number {
+	return Number.from(sSent);
+}
+
+/**
+ * 最近一次错误信息，空字符串表示没有错误。
+ */
+export function getLastError(): string {
+	return sErr;
+}
+
+/**
+ * 系统姿态传感器的状态（页面用来显示「姿态参考」有没有接上）：
+ *   ok / 等待数据… / 未启动 / 这台设备没有旋转向量传感器 …
+ */
+export function getAttitudeStatus(): string {
+	return sAttStatus;
+}

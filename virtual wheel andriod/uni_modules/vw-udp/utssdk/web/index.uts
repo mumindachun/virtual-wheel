@@ -1,0 +1,72 @@
+/**
+ * vw-udp —— Web（H5 预览）空实现
+ *
+ * 为什么需要这个文件：
+ *   浏览器里拿不到原始 UDP socket（只有 WebRTC/WebSocket），也读不到系统陀螺仪，
+ *   所以这一端只能“什么都不做”。它的唯一作用是让 `@/uni_modules/vw-udp`
+ *   在 web 端能解析成功，页面不会因为找不到模块而白屏。
+ *
+ * 真正跑 demo 请用 HBuilderX 运行到 Android 真机（走 utssdk/app-android/index.uts）。
+ * 注意：这里导出的函数签名必须和 app-android/index.uts 完全一致，
+ *       否则页面在 web 端调用 setButtons/pushFlags/sendConfig 会报 undefined。
+ */
+
+let sErr: string = '';
+
+export function openUdp(_host: string, _port: number): void {
+	sErr = 'Web 预览不支持 UDP：请运行到 Android 真机';
+}
+
+export function sendSample(_gx: number, _gy: number, _gz: number, _ax: number, _ay: number, _az: number, _t: number): void {
+	// 预览模式不发送
+}
+
+export function setButtons(_mask: number): void {
+	// 预览模式不发送
+}
+
+export function pushFlags(_flags: number): void {
+	// 预览模式不发送
+}
+
+export function sendConfig(_rangeDeg: number, _axis: number, _deadzone: number, _smoothing: number, _selfCenter: number): void {
+	// 预览模式不发送
+}
+
+export function closeUdp(): void {
+	// 预览模式没有连接需要关闭
+}
+
+export function getSentCount(): number {
+	return 0;
+}
+
+export function getLastError(): string {
+	return sErr;
+}
+
+/** 浏览器里没有系统姿态传感器 */
+export function getAttitudeStatus(): string {
+	return 'Web 预览没有姿态传感器';
+}
+
+/** 浏览器里没有系统陀螺仪，读数恒为 0 */
+export function getGx(): number {
+	return 0;
+}
+
+export function getGy(): number {
+	return 0;
+}
+
+export function getGz(): number {
+	return 0;
+}
+
+export function getMotionStatus(): string {
+	return 'Web 预览没有传感器';
+}
+
+export function getSampleId(): number {
+	return 0;
+}

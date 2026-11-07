@@ -1,0 +1,645 @@
+<script setup>
+	// 设置页：外观 / 语言 / 屏幕方向 / 连接 / 角度范围 / 转向轴 / 滤波。
+	// 改动只写内存里的 settings，点「保存」才落盘并返回主界面。
+	import { ref, computed } from 'vue'
+	import { settings, saveSettings, resetSettings, applyTheme, RANGE_MIN, RANGE_MAX, RANGE_PRESETS, clampRange } from '@/common/settings.js'
+	import { i18nState, strings, t, setLang, langName, axisName } from '@/common/i18n.js'
+
+	const ui = computed(() => strings(i18nState.lang))
+
+	const theme = ref(String(settings.theme))
+	const language = ref(String(settings.language))
+	const orientation = ref(String(settings.orientation))
+	const ip = ref(String(settings.ip))
+	const port = ref(String(settings.port))
+	const range = ref(Number(settings.range))
+	const rangeText = ref(String(settings.range))
+	const axis = ref(Number(settings.axis))
+	const deadzone = ref(String(settings.deadzone))
+	const smoothing = ref(String(settings.smoothing))
+	const selfCenter = ref(String(settings.selfCenter))
+	const tip = ref('')
+
+	// 去掉系统导航栏，自己给状态栏留高度
+	const statusBarH = ref(0)
+	try {
+		const win = uni.getWindowInfo()
+		statusBarH.value = Number(win.statusBarHeight) || 0
+	} catch (e) {
+		statusBarH.value = 0
+	}
+	const pageStyle = computed(() => {
+		return { paddingTop: (statusBarH.value + 10) + 'px' }
+	})
+
+	function goBack() {
+		uni.navigateBack()
+	}
+
+	const themeOptions = computed(() => {
+		const s = ui.value
+		return [
+			{ v: 'auto', label: s.theme_auto },
+			{ v: 'light', label: s.theme_light },
+			{ v: 'dark', label: s.theme_dark }
+		]
+	})
+	const orientOptions = computed(() => {
+		const s = ui.value
+		return [
+			{ v: 'auto', label: s.orient_auto },
+			{ v: 'landscape', label: s.orient_landscape },
+			{ v: 'portrait', label: s.orient_portrait }
+		]
+	})
+	const langOptions = computed(() => {
+		const list = ['auto', 'zh-Hans', 'zh-Hant', 'en']
+		const out = []
+		for (let i = 0; i < list.length; i = i + 1) {
+			out.push({ v: list[i], label: langName(list[i]) })
+		}
+		return out
+	})
+	const AXIS_OPTIONS = [0, 1, 2, 3]
+	const axisTexts = computed(() => {
+		const out = []
+		for (let i = 0; i < AXIS_OPTIONS.length; i = i + 1) {
+			out.push(axisName(AXIS_OPTIONS[i]))
+		}
+		return out
+	})
+
+	function pickRange(v) {
+		range.value = clampRange(v)
+		rangeText.value = String(range.value)
+	}
+
+	// 无级调节：±1 / ±10 两档步进，输入框里也能直接打任意整数
+	function stepRange(delta) {
+		pickRange(range.value + delta)
+	}
+
+	function applyRangeText() {
+		range.value = clampRange(rangeText.value)
+		rangeText.value = String(range.value)
+	}
+
+	function pickAxis(v) {
+		axis.value = v
+	}
+
+	// 主题/语言点一下立刻生效（方便看效果），点保存才落盘
+	function pickTheme(v) {
+		theme.value = v
+		settings.theme = v
+		applyTheme()
+	}
+
+	function pickLanguage(v) {
+		language.value = v
+		settings.language = v
+		setLang(v)
+	}
+
+	function pickOrientation(v) {
+		orientation.value = v
+	}
+
+	// 输入框字符串 → 合法数字，非法就用兜底值
+	function numOr(text, min, max, fallback) {
+		const v = parseFloat(String(text).replace(',', '.'))
+		if (isNaN(v)) {
+			return fallback
+		}
+		if (v < min) {
+			return min
+		}
+		if (v > max) {
+			return max
+		}
+		return v
+	}
+
+	function save() {
+		const host = String(ip.value).trim()
+		const parts = host.split('.')
+		if (parts.length !== 4) {
+			tip.value = t('badIpLong')
+			return
+		}
+		const p = parseInt(String(port.value), 10)
+		if (isNaN(p) || p <= 0 || p > 65535) {
+			tip.value = t('badPortLong')
+			return
+		}
+
+		settings.ip = host
+		settings.port = String(p)
+		settings.range = clampRange(rangeText.value)
+		settings.axis = axis.value
+		settings.deadzone = numOr(deadzone.value, 0, 1, 0.02)
+		settings.smoothing = numOr(smoothing.value, 0, 0.95, 0.3)
+		settings.selfCenter = numOr(selfCenter.value, 0, 20, 0)
+		settings.theme = String(theme.value)
+		settings.orientation = String(orientation.value)
+		settings.language = String(language.value)
+		setLang(settings.language)
+		saveSettings()
+		applyTheme()
+
+		uni.showToast({ title: t('saved'), icon: 'none' })
+		uni.navigateBack()
+	}
+
+	function restore() {
+		resetSettings()
+		theme.value = String(settings.theme)
+		language.value = String(settings.language)
+		orientation.value = String(settings.orientation)
+		ip.value = String(settings.ip)
+		port.value = String(settings.port)
+		range.value = Number(settings.range)
+		rangeText.value = String(settings.range)
+		axis.value = Number(settings.axis)
+		deadzone.value = String(settings.deadzone)
+		smoothing.value = String(settings.smoothing)
+		selfCenter.value = String(settings.selfCenter)
+		setLang(settings.language)
+		applyTheme()
+		tip.value = t('restored')
+	}
+</script>
+
+<template>
+	<scroll-view class="page" :scroll-y="true" :style="pageStyle">
+		<view class="head">
+			<view class="back" @click="goBack">
+				<text class="back-t">{{ ui.back }}</text>
+			</view>
+			<text class="head-t">{{ ui.settings }}</text>
+			<view class="head-gap"></view>
+		</view>
+
+		<view class="card">
+			<text class="sub">{{ ui.secAppearance }}</text>
+			<view class="seg">
+				<view v-for="opt in themeOptions" :key="opt.v" :class="theme === opt.v ? 'seg-item sel' : 'seg-item'"
+					@click="pickTheme(opt.v)">
+					<text :class="theme === opt.v ? 'seg-text seg-text-sel' : 'seg-text'">{{ opt.label }}</text>
+				</view>
+			</view>
+			<text class="note">{{ ui.noteTheme }}</text>
+		</view>
+
+		<view class="card">
+			<text class="sub">{{ ui.secLanguage }}</text>
+			<view class="lang-list">
+				<view v-for="opt in langOptions" :key="opt.v" class="lang-row" @click="pickLanguage(opt.v)">
+					<text :class="language === opt.v ? 'lang-t lang-t-sel' : 'lang-t'">{{ opt.label }}</text>
+					<text class="lang-check">{{ language === opt.v ? '✓' : '' }}</text>
+				</view>
+			</view>
+			<text class="note">{{ ui.noteLanguage }}</text>
+		</view>
+
+		<view class="card">
+			<text class="sub">{{ ui.secOrientation }}</text>
+			<view class="seg">
+				<view v-for="opt in orientOptions" :key="opt.v" :class="orientation === opt.v ? 'seg-item sel' : 'seg-item'"
+					@click="pickOrientation(opt.v)">
+					<text :class="orientation === opt.v ? 'seg-text seg-text-sel' : 'seg-text'">{{ opt.label }}</text>
+				</view>
+			</view>
+			<text class="note">{{ ui.noteOrientation }}</text>
+		</view>
+
+		<view class="card">
+			<text class="sub">{{ ui.secConnection }}</text>
+			<view class="row">
+				<text class="label">{{ ui.labelIp }}</text>
+				<input class="input" v-model="ip" placeholder="192.168.1.100" />
+			</view>
+			<view class="row">
+				<text class="label">{{ ui.labelPort }}</text>
+				<input class="input" v-model="port" type="number" placeholder="8888" />
+			</view>
+			<text class="note">{{ ui.noteConnection }}</text>
+		</view>
+
+		<view class="card">
+			<text class="sub">{{ ui.secRange }}</text>
+			<view class="range-row">
+				<view class="step-btn" @click="stepRange(-10)"><text class="step-t">−10</text></view>
+				<view class="step-btn" @click="stepRange(-1)"><text class="step-t">−1</text></view>
+				<input class="range-input" v-model="rangeText" type="number" @blur="applyRangeText"
+					@confirm="applyRangeText" />
+				<view class="step-btn" @click="stepRange(1)"><text class="step-t">+1</text></view>
+				<view class="step-btn" @click="stepRange(10)"><text class="step-t">+10</text></view>
+			</view>
+			<view class="chips">
+				<view v-for="p in RANGE_PRESETS" :key="p" :class="range === p ? 'chip sel2' : 'chip'"
+					@click="pickRange(p)">
+					<text :class="range === p ? 'chip-t sel2-t' : 'chip-t'">±{{ p }}°</text>
+				</view>
+			</view>
+			<text class="note">{{ t('rangeTotal', range * 2, range) }}</text>
+			<text class="note">{{ ui.noteRange }}</text>
+		</view>
+
+		<view class="card">
+			<text class="sub">{{ ui.secAxis }}</text>
+			<view class="seg">
+				<view v-for="a in AXIS_OPTIONS" :key="a" :class="axis === a ? 'seg-item sel' : 'seg-item'"
+					@click="pickAxis(a)">
+					<text :class="axis === a ? 'seg-text seg-text-sel' : 'seg-text'">{{ axisTexts[a] }}</text>
+				</view>
+			</view>
+			<text class="note">{{ ui.noteAxis }}</text>
+		</view>
+
+		<view class="card">
+			<text class="sub">{{ ui.secFilter }}</text>
+			<view class="row">
+				<text class="label">{{ ui.labelDeadzone }}</text>
+				<input class="input" v-model="deadzone" type="digit" placeholder="0.02" />
+				<text class="unit">{{ ui.unitRate }}</text>
+			</view>
+			<view class="row">
+				<text class="label">{{ ui.labelSmoothing }}</text>
+				<input class="input" v-model="smoothing" type="digit" placeholder="0.3" />
+				<text class="unit">{{ ui.unitSmooth }}</text>
+			</view>
+			<view class="row">
+				<text class="label">{{ ui.labelSelfCenter }}</text>
+				<input class="input" v-model="selfCenter" type="digit" placeholder="0" />
+				<text class="unit">{{ ui.unitPerSec }}</text>
+			</view>
+			<text class="note">{{ ui.noteFilter }}</text>
+		</view>
+
+		<view class="btns">
+			<view class="btn save" @click="save">
+				<text class="btn-t save-t">{{ ui.save }}</text>
+			</view>
+			<view class="btn ghost" @click="restore">
+				<text class="btn-t ghost-t">{{ ui.restore }}</text>
+			</view>
+		</view>
+
+		<text class="tip">{{ tip }}</text>
+		<view class="footer"></view>
+	</scroll-view>
+</template>
+
+<style>
+	/* 浅色为基础，深色只在媒体查询里覆盖 */
+	.page {
+		flex: 1;
+		background-color: #f2f3f5;
+		padding: 16px;
+	}
+
+	.head {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 12px;
+	}
+
+	.back {
+		padding: 6px 12px;
+		border-radius: 12px;
+		background-color: #ffffff;
+	}
+
+	.back-t {
+		font-size: 14px;
+		color: #1a73e8;
+	}
+
+	.head-t {
+		font-size: 17px;
+		font-weight: bold;
+		color: #1f2329;
+	}
+
+	.head-gap {
+		width: 74px;
+	}
+
+	.card {
+		background-color: #ffffff;
+		border-radius: 14px;
+		padding: 16px;
+		margin-bottom: 14px;
+	}
+
+	.sub {
+		font-size: 15px;
+		font-weight: bold;
+		color: #1f2329;
+		margin-bottom: 12px;
+	}
+
+	.row {
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 10px;
+	}
+
+	.label {
+		width: 84px;
+		font-size: 15px;
+		color: #444444;
+	}
+
+	.input {
+		flex: 1;
+		height: 40px;
+		font-size: 16px;
+		color: #1f2329;
+		background-color: #f7f8fa;
+		border: 1px solid #dddddd;
+		border-radius: 8px;
+		padding: 0 10px;
+	}
+
+	.unit {
+		width: 62px;
+		font-size: 13px;
+		color: #8a8f99;
+		text-align: right;
+	}
+
+	.note {
+		font-size: 12px;
+		color: #8a8f99;
+		margin-top: 4px;
+		line-height: 17px;
+	}
+
+	.seg {
+		flex-direction: row;
+	}
+
+	.seg-item {
+		flex: 1;
+		height: 40px;
+		margin-right: 8px;
+		border-radius: 10px;
+		align-items: center;
+		justify-content: center;
+		background-color: #f2f3f5;
+	}
+
+	.seg-item.sel {
+		background-color: #1a73e8;
+	}
+
+	.seg-text {
+		font-size: 14px;
+		color: #1f2329;
+	}
+
+	.seg-text.seg-text-sel {
+		color: #ffffff;
+	}
+
+	.range-row {
+		flex-direction: row;
+		align-items: center;
+		margin-bottom: 12px;
+	}
+
+	.step-btn {
+		width: 44px;
+		height: 40px;
+		border-radius: 10px;
+		align-items: center;
+		justify-content: center;
+		background-color: #f2f3f5;
+	}
+
+	.step-t {
+		font-size: 14px;
+		color: #1f2329;
+	}
+
+	.range-input {
+		flex: 1;
+		height: 40px;
+		margin: 0 8px;
+		text-align: center;
+		font-size: 20px;
+		font-weight: bold;
+		color: #1a73e8;
+		background-color: #f7f8fa;
+		border: 1px solid #dddddd;
+		border-radius: 10px;
+	}
+
+	.chips {
+		flex-direction: row;
+		flex-wrap: wrap;
+	}
+
+	.chip {
+		padding: 6px 10px;
+		margin: 0 8px 8px 0;
+		border-radius: 9px;
+		background-color: #f2f3f5;
+	}
+
+	.chip.sel2 {
+		background-color: #1a73e8;
+	}
+
+	.chip-t {
+		font-size: 13px;
+		color: #1f2329;
+	}
+
+	.chip-t.sel2-t {
+		color: #ffffff;
+	}
+
+	.lang-list {
+		margin-top: 2px;
+	}
+
+	.lang-row {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		padding: 12px 4px;
+		border-bottom: 1px solid #eceef2;
+	}
+
+	.lang-t {
+		font-size: 15px;
+		color: #1f2329;
+	}
+
+	.lang-t.lang-t-sel {
+		color: #1a73e8;
+		font-weight: bold;
+	}
+
+	.lang-check {
+		font-size: 15px;
+		color: #1a73e8;
+	}
+
+	.btns {
+		flex-direction: row;
+		margin-top: 4px;
+	}
+
+	.btn {
+		flex: 1;
+		height: 48px;
+		margin: 0 6px;
+		border-radius: 12px;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.btn.save {
+		background-color: #1a73e8;
+	}
+
+	.btn.ghost {
+		background-color: #ffffff;
+	}
+
+	.btn-t {
+		font-size: 16px;
+		font-weight: bold;
+	}
+
+	.save-t {
+		color: #ffffff;
+	}
+
+	.ghost-t {
+		color: #1f2329;
+	}
+
+	.tip {
+		font-size: 12px;
+		color: #b26a00;
+		text-align: center;
+		margin-top: 12px;
+	}
+
+	.footer {
+		height: 24px;
+	}
+
+	@media (prefers-color-scheme: dark) {
+		.page {
+			background-color: #0f1115;
+		}
+
+		.back {
+			background-color: #1e232b;
+		}
+
+		.back-t {
+			color: #6ba4ff;
+		}
+
+		.head-t,
+		.sub {
+			color: #e6e8eb;
+		}
+
+		.card {
+			background-color: #171a21;
+		}
+
+		.label {
+			color: #c3c8d0;
+		}
+
+		.input {
+			color: #e6e8eb;
+			background-color: #1e232b;
+			border-color: #2b313b;
+		}
+
+		.unit,
+		.note {
+			color: #8b929d;
+		}
+
+		.seg-item {
+			background-color: #1e232b;
+		}
+
+		.seg-item.sel {
+			background-color: #3f7ce0;
+		}
+
+		.seg-text {
+			color: #d6dae1;
+		}
+
+		.seg-text.seg-text-sel {
+			color: #ffffff;
+		}
+
+		.step-btn,
+		.chip {
+			background-color: #1e232b;
+		}
+
+		.step-t,
+		.chip-t {
+			color: #d6dae1;
+		}
+
+		.range-input {
+			color: #6ba4ff;
+			background-color: #1e232b;
+			border-color: #2b313b;
+		}
+
+		.chip.sel2 {
+			background-color: #3f7ce0;
+		}
+
+		.chip-t.sel2-t {
+			color: #ffffff;
+		}
+
+		.lang-row {
+			border-bottom-color: #23282f;
+		}
+
+		.lang-t {
+			color: #d6dae1;
+		}
+
+		.lang-t.lang-t-sel,
+		.lang-check {
+			color: #6ba4ff;
+		}
+
+		.btn.save {
+			background-color: #3f7ce0;
+		}
+
+		.btn.ghost {
+			background-color: #1e232b;
+		}
+
+		.ghost-t {
+			color: #e6e8eb;
+		}
+
+		.tip {
+			color: #e0a44a;
+		}
+	}
+</style>

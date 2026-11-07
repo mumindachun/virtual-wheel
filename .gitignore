@@ -1,0 +1,50 @@
+# 虚拟方向盘 —— 仓库忽略规则
+# 只有源码、文档、协议说明值得提交；编译产物、依赖、IDE 配置、日志都不提交。
+# 路径里有空格（"virtual wheel andriod"）可以直接这么写，不用转义。
+
+# ---------- 通用 ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+*.tmp
+*.bak
+~$*
+
+# ---------- 编辑器 / IDE ----------
+.idea/
+.vscode/
+*.iml
+*.suo
+*.user
+*.swp
+
+# ---------- 手机端：uni-app x ----------
+# HBuilderX 的编译产物（每次「运行」都会重新生成，体积不小，绝对不能提交）
+virtual wheel andriod/unpackage/
+
+# HBuilderX 本地运行配置（launch.json 里是这台机器的运行目标）
+virtual wheel andriod/.hbuilderx/
+
+# 以后如果改用 CLI 构建会有这些
+virtual wheel andriod/node_modules/
+virtual wheel andriod/dist/
+
+# ---------- 电脑端：Python ----------
+# 虚拟环境（venv 里是几万个文件，绝对不能提交）
+virtual wheel desktop/venv/
+venv/
+.venv/
+
+# 字节码 / 缓存
+__pycache__/
+*.py[cod]
+*$py.class
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# 打包产物
+build/
+dist/
+*.egg-info/

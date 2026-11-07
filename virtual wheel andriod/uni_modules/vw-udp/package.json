@@ -1,0 +1,19 @@
+{
+	"id": "vw-udp",
+	"displayName": "vw-udp UDP 发送器",
+	"version": "0.1.0",
+	"description": "虚拟方向盘 demo 用的最小 UDP 发送插件：把陀螺仪样本打包成二进制小端数据报发到电脑端",
+	"keywords": [
+		"udp",
+		"gyroscope",
+		"virtual-wheel"
+	],
+	"uni_modules": {
+		"platforms": {
+			"android": {
+				"minVersion": "5.0"
+			},
+			"web": {}
+		}
+	}
+}

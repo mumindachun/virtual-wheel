@@ -1,0 +1,22 @@
+/**
+ * vw-screen 的 web 实现（浏览器预览用）
+ * 浏览器里不能锁屏幕方向，这里只做记录，不报错。
+ */
+
+let sMode: string = 'auto'
+
+export function setOrientation(mode: string): void {
+	if (mode == 'landscape' || mode == 'portrait') {
+		sMode = mode
+	} else {
+		sMode = 'auto'
+	}
+}
+
+export function getOrientation(): string {
+	return sMode
+}
+
+export function getLastError(): string {
+	return ''
+}

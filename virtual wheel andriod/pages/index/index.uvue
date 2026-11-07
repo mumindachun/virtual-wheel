@@ -1,0 +1,815 @@
+<script setup>
+	// 主界面：中间是开始/停止/回正/校准，两侧是 Xbox 按键（左摇杆由方向盘角度代替）。
+	// 蒸汽模式只支持组合式 API；H5 预览没有 UDP 和传感器，必须运行到 Android 真机。
+	import { ref, computed, onUnmounted } from 'vue'
+	import {
+		openUdp,
+		setButtons,
+		pushFlags,
+		sendConfig,
+		closeUdp,
+		getSentCount,
+		getLastError,
+		getAttitudeStatus,
+		getMotionStatus,
+		getGx,
+		getGy,
+		getGz
+	} from '@/uni_modules/vw-udp'
+	import { setOrientation, getLastError as getOrientationError } from '@/uni_modules/vw-screen'
+	import {
+		settings,
+		saveSettings,
+		configKey,
+		axisLabel,
+		rangeLabel,
+		themeLabel,
+		orientationLabel,
+		applyTheme
+	} from '@/common/settings.js'
+	import { i18nState, strings, t } from '@/common/i18n.js'
+
+	const ui = computed(() => strings(i18nState.lang))
+
+	// #ifdef WEB
+	const IS_WEB = true
+	// #endif
+	// #ifndef WEB
+	const IS_WEB = false
+	// #endif
+
+	// 与电脑端 protocol.py 的 flags 一致
+	const FLAG_ZERO = 1
+	const FLAG_RECALIB = 2
+
+	// 按键 code 与电脑端 BUTTON_CODES 一一对应，位图 bit = 1 << (code - 1)
+	const KEYS_LEFT = [
+		{ code: 7, name: 'LT' },
+		{ code: 5, name: 'LB' },
+		{ code: 9, name: 'L3' }
+	]
+	const KEYS_RIGHT = [
+		{ code: 8, name: 'RT' },
+		{ code: 6, name: 'RB' },
+		{ code: 10, name: 'L4' }
+	]
+	// 只用来拼「当前按下了哪些键」的文字
+	const ALL_KEYS = [
+		{ code: 1, name: 'A' },
+		{ code: 2, name: 'B' },
+		{ code: 3, name: 'X' },
+		{ code: 4, name: 'Y' },
+		{ code: 5, name: 'LB' },
+		{ code: 6, name: 'RB' },
+		{ code: 7, name: 'LT' },
+		{ code: 8, name: 'RT' },
+		{ code: 9, name: 'L3' },
+		{ code: 10, name: 'L4' },
+		{ code: 11, name: '↑' },
+		{ code: 12, name: '↓' },
+		{ code: 13, name: '←' },
+		{ code: 14, name: '→' }
+	]
+
+	const ORIENT_CYCLE = ['auto', 'landscape', 'portrait']
+	const THEME_CYCLE = ['auto', 'light', 'dark']
+
+	const running = ref(false)
+	const status = ref('')
+	const sent = ref(0)
+	const maskText = ref('-')
+	const meta = ref('')
+	const axisTip = ref('')
+	// 姿态传感器（旋转向量）只负责采集并随包发出，用不用由电脑端决定
+	const attText = ref('')
+	const gxText = ref('+0.000')
+	const gyText = ref('+0.000')
+	const gzText = ref('+0.000')
+	const pressedMask = ref(0)
+	const isLandscape = ref(true)
+	const themeText = ref(themeLabel())
+	const orientationText = ref(orientationLabel())
+
+	// 跟着语言走的界面文案（i18nState.lang 变了，这些会自动重算）
+	const statusLine = computed(() => (status.value !== '' ? status.value : ui.value.statusInit))
+	const startLabel = computed(() => (running.value ? ui.value.stop : ui.value.start))
+	const metaLine = computed(() => t('metaLine', sent.value, maskText.value))
+	const attLine = computed(() => t('attRef', attText.value))
+
+	// 采样在插件内部（≈200Hz），这里只保留 UI 相关的节流状态
+	let lastUiTime = 0
+	let tickTimer = null
+	// 运行中用来发现「设置页改了参数」
+	let cfgKey = ''
+	// 按键位图（数值，不等同于响应式的 pressedMask）
+	let mask = 0
+	// 设置页可能改了屏幕方向，回到主界面要跟上
+	let lastOrientation = String(settings.orientation)
+
+	// 去掉系统导航栏（pages.json 里的 navigationStyle: custom）后，内容会顶到屏幕最上面，
+	// 这里补一段状态栏高度（时间/电量那一行），否则顶栏会被系统图标盖住。
+	const statusBarH = ref(0)
+	try {
+		const win = uni.getWindowInfo()
+		statusBarH.value = Number(win.statusBarHeight) || 0
+	} catch (e) {
+		statusBarH.value = 0
+	}
+	const pageStyle = computed(() => {
+		return { paddingTop: (statusBarH.value + 10) + 'px' }
+	})
+
+	// 横屏：左列 | 中间 | ABXY | 右列，一整行
+	// 竖屏：上面几块改成一列往下排，两侧按键变成一行三个
+	const bodyStyle = computed(() => {
+		return isLandscape.value ? { flexDirection: 'row' } : { flexDirection: 'column' }
+	})
+	const padStyle = computed(() => {
+		return isLandscape.value
+			? { width: '22%', height: '100%', flexDirection: 'column' }
+			: { width: '100%', height: '78px', flexDirection: 'row' }
+	})
+	const centerStyle = computed(() => {
+		return isLandscape.value
+			? { flex: 1, height: '100%', paddingLeft: '8px', paddingRight: '8px' }
+			: { flex: 1, width: '100%', paddingTop: '10px', paddingBottom: '10px' }
+	})
+	const faceWrapStyle = computed(() => {
+		return isLandscape.value ? { width: '138px', height: '100%' } : { width: '100%', height: '156px' }
+	})
+	const dpadWrapStyle = computed(() => {
+		return isLandscape.value ? { width: '136px', height: '100%' } : { width: '100%', height: '136px' }
+	})
+
+	function signed(v) {
+		return (v >= 0 ? '+' : '') + v.toFixed(3)
+	}
+
+	function isOn(code) {
+		return (pressedMask.value & (1 << (code - 1))) !== 0
+	}
+
+	// 按键的 class：基础样式 + 按下时加 on
+	function cls(base, code) {
+		return isOn(code) ? base + ' on' : base
+	}
+
+	function maskLabel(m) {
+		const parts = []
+		for (let i = 0; i < ALL_KEYS.length; i = i + 1) {
+			const k = ALL_KEYS[i]
+			if ((m & (1 << (k.code - 1))) !== 0) {
+				parts.push(k.name)
+			}
+		}
+		return parts.length === 0 ? '-' : parts.join('+')
+	}
+
+	// 界面刷新限流到 100ms（采样在插件内部，这里只是偶尔读一下最新值）
+	function refreshUi() {
+		const now = Date.now()
+		if (now - lastUiTime < 100) {
+			return
+		}
+		lastUiTime = now
+		gxText.value = signed(getGx())
+		gyText.value = signed(getGy())
+		gzText.value = signed(getGz())
+		sent.value = getSentCount()
+	}
+
+	function refreshMeta() {
+		const s = ui.value
+		meta.value = rangeLabel() + ' · ' + s.axisWord + ' ' + axisLabel()
+		// 自动轴需要先打一次方向，电脑端才能识别旋转轴（识别状态显示在电脑端）
+		axisTip.value = Number(settings.axis) === 3 ? s.axisAutoTip : ''
+	}
+
+	function sendSettingsToPc() {
+		sendConfig(
+			Number(settings.range),
+			Number(settings.axis),
+			Number(settings.deadzone),
+			Number(settings.smoothing),
+			Number(settings.selfCenter)
+		)
+		cfgKey = configKey()
+	}
+
+	function press(code) {
+		if (!running.value) {
+			status.value = t('pressStartFirst')
+			return
+		}
+		mask = mask | (1 << (code - 1))
+		pressedMask.value = mask
+		setButtons(mask)
+		maskText.value = maskLabel(mask)
+	}
+
+	function release(code) {
+		mask = mask & ~(1 << (code - 1))
+		pressedMask.value = mask
+		setButtons(mask)
+		maskText.value = maskLabel(mask)
+	}
+
+	// 重新量一次窗口大小，决定横屏还是竖屏布局（强制方向后窗口尺寸会变）
+	function updateOrientationFromWindow() {
+		try {
+			const info = uni.getWindowInfo()
+			if (info.windowWidth !== undefined && info.windowHeight !== undefined) {
+				isLandscape.value = info.windowWidth > info.windowHeight
+			}
+		} catch (e) {
+			// 拿不到就保持原样
+		}
+	}
+
+	function applyOrientationMode(mode) {
+		settings.orientation = mode
+		if (!IS_WEB) {
+			setOrientation(mode)
+			const oe = getOrientationError()
+			if (oe !== '') {
+				status.value = oe
+			}
+		}
+		orientationText.value = orientationLabel()
+		saveSettings()
+		// 旋转是异步的，等它转完再量一次
+		setTimeout(updateOrientationFromWindow, 350)
+	}
+
+	function cycleOrientation() {
+		let i = ORIENT_CYCLE.indexOf(settings.orientation)
+		if (i < 0) {
+			i = 0
+		}
+		applyOrientationMode(ORIENT_CYCLE[(i + 1) % ORIENT_CYCLE.length])
+	}
+
+	function cycleTheme() {
+		let i = THEME_CYCLE.indexOf(settings.theme)
+		if (i < 0) {
+			i = 0
+		}
+		settings.theme = THEME_CYCLE[(i + 1) % THEME_CYCLE.length]
+		applyTheme()
+		themeText.value = themeLabel()
+		saveSettings()
+	}
+
+	function start() {
+		if (running.value) {
+			return
+		}
+		if (IS_WEB) {
+			status.value = t('webPreview')
+			return
+		}
+		const host = String(settings.ip).trim()
+		const p = parseInt(String(settings.port), 10)
+		const parts = host.split('.')
+		if (parts.length !== 4) {
+			status.value = t('badIp')
+			return
+		}
+		if (isNaN(p) || p <= 0 || p > 65535) {
+			status.value = t('badPort')
+			return
+		}
+
+		openUdp(host, p)
+		// 先把当前设置下发给电脑端，再开始发样本
+		sendSettingsToPc()
+
+		// 传感器由插件内部注册（SENSOR_DELAY 5000us，约 200Hz），页面不再调用 uni.startGyroscope，
+		// 这样既突破了 uni 只有 game/ui/normal 三档（50/16/5Hz）的限制，也省掉了 JS 桥的开销。
+		running.value = true
+		refreshMeta()
+		const ms = getMotionStatus()
+		status.value = t('statusRun', host, p, ms)
+	}
+
+	function stop() {
+		mask = 0
+		pressedMask.value = 0
+		maskText.value = '-'
+		setButtons(0)
+		closeUdp()
+		running.value = false
+		sent.value = 0
+		attText.value = ''
+		status.value = t('stopped')
+	}
+
+	function toggleRun() {
+		if (running.value) {
+			stop()
+		} else {
+			start()
+		}
+	}
+
+	// 一次性动作：连发 3 包，电脑端收到后去重
+	function doZero() {
+		if (!running.value) {
+			status.value = t('pressStartTo')
+			return
+		}
+		pushFlags(FLAG_ZERO)
+		status.value = t('zeroRequested')
+	}
+
+	function doRecalib() {
+		if (!running.value) {
+			status.value = t('pressStartTo')
+			return
+		}
+		pushFlags(FLAG_RECALIB)
+		status.value = t('recalibRequested')
+	}
+
+	function goSettings() {
+		uni.navigateTo({ url: '/pages/settings/settings' })
+	}
+
+	// 页面一进来就把存过的外观/方向用上
+	applyTheme()
+	applyOrientationMode(settings.orientation)
+	updateOrientationFromWindow()
+
+	// 常驻 500ms 心跳：刷状态、发现设置变化、把插件里的错误抬到界面
+	tickTimer = setInterval(() => {
+		lastUiTime = 0
+		refreshMeta()
+		refreshUi()
+		updateOrientationFromWindow()
+		// 设置页改了方向：这里补一次，不用重开 App
+		if (String(settings.orientation) !== lastOrientation) {
+			lastOrientation = String(settings.orientation)
+			applyOrientationMode(lastOrientation)
+		}
+		// 设置页改了主题：CSS 媒体查询跟着 App 主题走，这里补一次
+		themeText.value = themeLabel()
+		orientationText.value = orientationLabel()
+		if (running.value) {
+			attText.value = getAttitudeStatus()
+			if (configKey() !== cfgKey) {
+				sendSettingsToPc()
+				status.value = t('paramsUpdated')
+			}
+			const err = getLastError()
+			if (err !== '') {
+				status.value = err
+			}
+		}
+	}, 500)
+
+	onUnmounted(() => {
+		if (tickTimer !== null) {
+			clearInterval(tickTimer)
+			tickTimer = null
+		}
+		stop()
+	})
+</script>
+
+<template>
+	<view class="page" :style="pageStyle">
+		<view class="topbar">
+			<text class="brand">{{ ui.appTitle }}</text>
+			<view class="chips">
+				<view class="chip" @click="cycleOrientation">
+					<text class="chip-t">{{ orientationText }}</text>
+				</view>
+				<view class="chip" @click="cycleTheme">
+					<text class="chip-t">{{ themeText }}</text>
+				</view>
+				<view class="chip" @click="goSettings">
+					<text class="chip-t">{{ ui.settings }}</text>
+				</view>
+			</view>
+		</view>
+
+		<view class="body" :style="bodyStyle">
+			<!-- 左手：LT / LB / L3 -->
+			<view class="pad" :style="padStyle">
+				<view v-for="b in KEYS_LEFT" :key="b.code" :class="cls('trig', b.code)" @touchstart="press(b.code)"
+					@touchend="release(b.code)" @touchcancel="release(b.code)">
+					<text class="trig-t">{{ b.name }}</text>
+				</view>
+			</view>
+
+			<!-- 十字方向键 -->
+			<view class="dpad-wrap" :style="dpadWrapStyle">
+				<view class="dpad">
+					<view class="dp-row">
+						<view class="dp-gap"></view>
+						<view :class="cls('dp-btn', 11)" @touchstart="press(11)" @touchend="release(11)"
+							@touchcancel="release(11)">
+							<text class="dp-t">▲</text>
+						</view>
+						<view class="dp-gap"></view>
+					</view>
+					<view class="dp-row">
+						<view :class="cls('dp-btn', 13)" @touchstart="press(13)" @touchend="release(13)"
+							@touchcancel="release(13)">
+							<text class="dp-t">◀</text>
+						</view>
+						<view class="dp-gap"></view>
+						<view :class="cls('dp-btn', 14)" @touchstart="press(14)" @touchend="release(14)"
+							@touchcancel="release(14)">
+							<text class="dp-t">▶</text>
+						</view>
+					</view>
+					<view class="dp-row">
+						<view class="dp-gap"></view>
+						<view :class="cls('dp-btn', 12)" @touchstart="press(12)" @touchend="release(12)"
+							@touchcancel="release(12)">
+							<text class="dp-t">▼</text>
+						</view>
+						<view class="dp-gap"></view>
+					</view>
+				</view>
+			</view>
+
+			<!-- 中间：状态 + 开始/停止 + 回正/校准 -->
+			<view class="center" :style="centerStyle">
+				<text class="status">{{ statusLine }}</text>
+				<view :class="running ? 'main-btn on' : 'main-btn'" @click="toggleRun">
+					<text class="main-t">{{ startLabel }}</text>
+				</view>
+				<view class="row2">
+					<view class="mini" @click="doZero">
+						<text class="mini-t">{{ ui.zero }}</text>
+					</view>
+					<view class="mini" @click="doRecalib">
+						<text class="mini-t">{{ ui.recalib }}</text>
+					</view>
+				</view>
+				<view class="meta-row">
+					<text class="meta">{{ meta }}</text>
+					<text class="meta">{{ metaLine }}</text>
+				</view>
+				<text v-if="axisTip !== ''" class="tip">{{ axisTip }}</text>
+				<text v-if="attText !== ''" class="tip">{{ attLine }}</text>
+				<text class="gyro">gx {{ gxText }}  gy {{ gyText }}  gz {{ gzText }}</text>
+			</view>
+
+			<!-- ABXY 菱形 -->
+			<view class="face-wrap" :style="faceWrapStyle">
+				<view class="face">
+					<view :class="cls('fb y', 4)" @touchstart="press(4)" @touchend="release(4)" @touchcancel="release(4)">
+						<text class="fb-t">Y</text>
+					</view>
+					<view class="face-mid">
+						<view :class="cls('fb x', 3)" @touchstart="press(3)" @touchend="release(3)"
+							@touchcancel="release(3)">
+							<text class="fb-t">X</text>
+						</view>
+						<view :class="cls('fb b', 2)" @touchstart="press(2)" @touchend="release(2)"
+							@touchcancel="release(2)">
+							<text class="fb-t">B</text>
+						</view>
+					</view>
+					<view :class="cls('fb a', 1)" @touchstart="press(1)" @touchend="release(1)" @touchcancel="release(1)">
+						<text class="fb-t">A</text>
+					</view>
+				</view>
+			</view>
+
+			<!-- 右手：RT / RB / L4 -->
+			<view class="pad" :style="padStyle">
+				<view v-for="b in KEYS_RIGHT" :key="b.code" :class="cls('trig', b.code)" @touchstart="press(b.code)"
+					@touchend="release(b.code)" @touchcancel="release(b.code)">
+					<text class="trig-t">{{ b.name }}</text>
+				</view>
+			</view>
+		</view>
+	</view>
+</template>
+
+<style>
+	/* 基础（浅色）配色写在外面，深色只在媒体查询里覆盖，这样即使媒体查询不生效也看得见 */
+	.page {
+		flex: 1;
+		padding: 12px;
+		background-color: #f2f3f5;
+	}
+
+	.topbar {
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		margin-bottom: 10px;
+	}
+
+	.brand {
+		font-size: 18px;
+		font-weight: bold;
+		color: #1f2329;
+	}
+
+	.chips {
+		flex-direction: row;
+		align-items: center;
+	}
+
+	.chip {
+		padding: 6px 12px;
+		margin-left: 8px;
+		border-radius: 14px;
+		background-color: #ffffff;
+	}
+
+	.chip-t {
+		font-size: 13px;
+		color: #1a73e8;
+	}
+
+	.body {
+		flex: 1;
+		align-items: center;
+	}
+
+	.pad {
+		justify-content: space-between;
+	}
+
+	.dpad-wrap {
+		align-items: center;
+		justify-content: center;
+	}
+
+	.dpad {
+		width: 132px;
+		height: 132px;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.dp-row {
+		flex-direction: row;
+	}
+
+	.dp-gap {
+		width: 44px;
+		height: 44px;
+	}
+
+	.dp-btn {
+		width: 44px;
+		height: 44px;
+		border-radius: 10px;
+		align-items: center;
+		justify-content: center;
+		background-color: #e6e8eb;
+	}
+
+	.dp-btn.on {
+		background-color: #1a73e8;
+	}
+
+	.dp-t {
+		font-size: 16px;
+		color: #1f2329;
+	}
+
+	.dp-btn.on .dp-t {
+		color: #ffffff;
+	}
+
+	.trig {
+		flex: 1;
+		margin: 4px;
+		border-radius: 16px;
+		align-items: center;
+		justify-content: center;
+		background-color: #e6e8eb;
+	}
+
+	.trig.on {
+		background-color: #1a73e8;
+	}
+
+	.trig-t {
+		font-size: 16px;
+		font-weight: bold;
+		color: #1f2329;
+	}
+
+	.trig.on .trig-t {
+		color: #ffffff;
+	}
+
+	.center {
+		align-items: center;
+		justify-content: center;
+	}
+
+	.status {
+		font-size: 13px;
+		color: #1a73e8;
+		text-align: center;
+		line-height: 18px;
+		margin-bottom: 14px;
+	}
+
+	.main-btn {
+		width: 132px;
+		height: 132px;
+		border-radius: 66px;
+		align-items: center;
+		justify-content: center;
+		background-color: #1a73e8;
+	}
+
+	.main-btn.on {
+		background-color: #d93025;
+	}
+
+	.main-t {
+		font-size: 24px;
+		font-weight: bold;
+		color: #ffffff;
+	}
+
+	.row2 {
+		flex-direction: row;
+		margin-top: 14px;
+	}
+
+	.mini {
+		padding: 10px 18px;
+		margin: 0 6px;
+		border-radius: 12px;
+		background-color: #ffffff;
+	}
+
+	.mini-t {
+		font-size: 10px;
+		color: #1f2329;
+	}
+
+	.meta-row {
+		flex-direction: row;
+		margin-top: 14px;
+	}
+
+	.meta {
+		font-size: 12px;
+		color: #8a8f99;
+		margin: 0 6px;
+	}
+
+	.tip {
+		font-size: 11px;
+		color: #b26a00;
+		text-align: center;
+		line-height: 15px;
+		margin-top: 8px;
+	}
+
+	.gyro {
+		font-size: 11px;
+		color: #8a8f99;
+		margin-top: 10px;
+	}
+
+	.face-wrap {
+		align-items: center;
+		justify-content: center;
+	}
+
+	.face {
+		width: 126px;
+		height: 138px;
+		align-items: center;
+		justify-content: space-between;
+	}
+
+	.face-mid {
+		width: 126px;
+		flex-direction: row;
+		justify-content: space-between;
+	}
+
+	.fb {
+		width: 46px;
+		height: 46px;
+		border-radius: 23px;
+		align-items: center;
+		justify-content: center;
+	}
+
+	.fb-t {
+		font-size: 17px;
+		font-weight: bold;
+		color: #ffffff;
+	}
+
+	.fb.a {
+		background-color: #2e9e4f;
+	}
+
+	.fb.a.on {
+		background-color: #1b6b34;
+	}
+
+	.fb.b {
+		background-color: #d93025;
+	}
+
+	.fb.b.on {
+		background-color: #8f1f18;
+	}
+
+	.fb.x {
+		background-color: #1a73e8;
+	}
+
+	.fb.x.on {
+		background-color: #12518f;
+	}
+
+	.fb.y {
+		background-color: #d9a600;
+	}
+
+	.fb.y.on {
+		background-color: #8f6d00;
+	}
+
+	@media (prefers-color-scheme: dark) {
+		.page {
+			background-color: #0f1115;
+		}
+
+		.brand {
+			color: #e6e8eb;
+		}
+
+		.chip {
+			background-color: #1e232b;
+		}
+
+		.chip-t {
+			color: #6ba4ff;
+		}
+
+		.trig {
+			background-color: #262b35;
+		}
+
+		.trig.on {
+			background-color: #3f7ce0;
+		}
+
+		.trig-t {
+			color: #d6dae1;
+		}
+
+		.dp-btn {
+			background-color: #262b35;
+		}
+
+		.dp-btn.on {
+			background-color: #3f7ce0;
+		}
+
+		.dp-t {
+			color: #d6dae1;
+		}
+
+		.status {
+			color: #6ba4ff;
+		}
+
+		.main-btn {
+			background-color: #3f7ce0;
+		}
+
+		.main-btn.on {
+			background-color: #c33b30;
+		}
+
+		.mini {
+			background-color: #1e232b;
+		}
+
+		.mini-t {
+			color: #e6e8eb;
+		}
+
+		.meta,
+		.gyro {
+			color: #8b929d;
+		}
+
+		.tip {
+			color: #e0a44a;
+		}
+	}
+</style>

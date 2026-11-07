@@ -1,0 +1,7 @@
+# 忽略规则统一放在仓库根目录的 .gitignore（上一级目录）。
+# 这个文件保留只是为了在单独打开 desktop 目录时仍能看到几条关键规则。
+venv/
+__pycache__/
+*.pyc
+.idea/
+*.log
