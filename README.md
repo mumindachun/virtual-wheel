@@ -1,5 +1,9 @@
 # 虚拟方向盘
 
+<p align="center">
+  <b>简体中文</b> · <a href="README.en.md">English</a>
+</p>
+
 以 Android 设备陀螺仪作为输入，经局域网 UDP 传输至 PC 端完成滤波、积分与映射，最终写入虚拟 Xbox 360 手柄（vgamepad + ViGEmBus）：
 
 **移动端传感器 / 按键 → UDP → PC 端信号处理 → 虚拟手柄 → 游戏**
@@ -92,7 +96,7 @@ python main.py --interval 0.01      # 缩短状态输出间隔
 | `virtual wheel andriod/` | uni-app x 移动端：`pages/` 界面与设置、`uni_modules/vw-udp` 传感器采集与 UDP、`vw-screen` 屏幕方向控制 |
 | `virtual wheel desktop/` | PC 端：`main.py` 入口、`vwheel/` 协议与算法与手柄与命令行、`tools/` 仿真数据与联调脚本 |
 
-各端实现细节分别参见 [PC 端 README](<virtual wheel desktop/README.md>) 与 [移动端 README](<virtual wheel andriod/README.md>)。
+各端实现细节分别参见 [PC 端 README](virtual%20wheel%20desktop/README.md) 与 [移动端 README](virtual%20wheel%20andriod/README.md)。
 
 ## 已知限制
 
